@@ -1,0 +1,98 @@
+from concurrent.futures import ThreadPoolExecutor
+import json
+import re
+from bs4 import BeautifulSoup
+from google.colab import files
+import requests
+import urllib3
+
+# Elak ralat sijil SSL yang biasa berlaku pada laman web kerajaan (.gov.my)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BASE_URL = "https://pharmacy.moh.gov.my/en/apps/fukkm"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+
+def dapatkan_jumlah_halaman():
+  res = requests.get(BASE_URL, headers=HEADERS, verify=False, timeout=20)
+  soup = BeautifulSoup(res.text, "html.parser")
+  pages = [0]
+  for a in soup.select("a[href*='page=']"):
+    m = re.search(r"page=(\d+)", a.get("href", ""))
+    if m:
+      pages.append(int(m.group(1)))
+  return max(pages)
+
+
+def ringkaskan_indication(text):
+  if not text:
+    return ""
+  # 1. Kemaskan ruang kosong & baris baharu
+  text = re.sub(r"\s+", " ", text).strip()
+
+  # 2. Pecahkan jika ada senarai i), ii), iii) dan ambil 2 indikasi utama terawal sahaja
+  bahagian = re.split(r"(?:^|\s)(?:i|ii|iii|iv|v|vi)[\.\)]\s+", text)
+  bahagian = [b.strip(" ;,.") for b in bahagian if b.strip()]
+  utama = "; ".join(bahagian[:2]) if bahagian else text
+
+  # 3. Buang frasa pembuka yang terlalu panjang
+  utama = re.sub(
+      r"^(Indicated\s+(?:in\s+combination\s+.*?for\s+)?(?:for\s+)?(?:the\s+)?|For\s+the\s+|Management\s+of\s+patients\s+with\s+)",
+      "",
+      utama,
+      flags=re.IGNORECASE,
+  )
+
+  # 4. Ambil ayat pertama sahaja (buang syarat tambahan seperti kriteria DSM/ICD)
+  ayat_pertama = re.split(r"(?<!eg)(?<!sp)(?<!etc)\.\s+(?=[A-Z])", utama)[0]
+
+  # 5. Hadkan panjang maksimum supaya kekal ringkas di skrin
+  if len(ayat_pertama) > 150:
+    ayat_pertama = ayat_pertama[:147].rsplit(" ", 1)[0] + "..."
+
+  return (
+      ayat_pertama[0].upper() + ayat_pertama[1:]
+      if len(ayat_pertama) > 1
+      else ayat_pertama
+  )
+
+
+def tarik_satu_halaman(page):
+  url = f"{BASE_URL}?page={page}"
+  try:
+    res = requests.get(url, headers=HEADERS, verify=False, timeout=25)
+    soup = BeautifulSoup(res.text, "html.parser")
+    rows = soup.select("table tbody tr")
+    hasil = []
+    for r in rows:
+      cols = [td.get_text(" ", strip=True) for td in r.find_all("td")]
+      # Susunan kolum FUKKM: [0]# | [1]Generic Name | [2]MDC | [3]Category | [4]Indications | [5]Pres. Restrictions | [6]Dosage
+      if len(cols) >= 7:
+        hasil.append({
+            "generic_name": cols[1],
+            "mdc_code": cols[2].replace("-", "").strip(),
+            "category": cols[3],
+            "indication": ringkaskan_indication(cols[4]),
+            "dosage": re.sub(r"\s+", " ", cols[6]).strip(),
+        })
+    return hasil
+  except Exception as e:
+    print(f"Ralat pada halaman {page}: {e}")
+    return []
+
+
+print("Menyemak jumlah halaman FUKKM...")
+max_page = dapatkan_jumlah_halaman()
+print(f"Sedang menarik data dari {max_page + 1} halaman secara serentak...")
+
+semua_ubat = []
+with ThreadPoolExecutor(max_workers=6) as executor:
+  for rekod_halaman in executor.map(tarik_satu_halaman, range(max_page + 1)):
+    semua_ubat.extend(rekod_halaman)
+
+nama_fail = "my_fukkm.json"
+with open(nama_fail, "w", encoding="utf-8") as f:
+  json.dump(semua_ubat, f, ensure_ascii=False, separators=(",", ":"))
+
+print(f"Siap! {len(semua_ubat)} rekod FUKKM berjaya diringkaskan.")
+files.download(nama_fail)
